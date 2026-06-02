@@ -1,0 +1,24 @@
+# ENV FILES
+backend/.env
+.env
+
+# PYTHON
+__pycache__/
+*.pyc
+
+# VENV
+venv/
+backend/venv/
+
+# LOGS
+*.log
+
+# NODE / FRONTEND
+node_modules/
+dist/
+dist-ssr/
+
+# EDITORS
+.vscode/
+.idea/
+.DS_Store
