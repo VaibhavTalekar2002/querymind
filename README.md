@@ -1,5 +1,7 @@
 # QueryMind.ai - AI SQL Analytics Platform
 
+👉 Live Application: https://querymind-ruddy.vercel.app/
+
 ## 1. Project Overview
 
 QueryMind.ai is a full-stack AI-powered SQL analytics dashboard that allows users to ask natural language questions about a connected database and receive SQL queries, tabular results, visualizations, and AI-generated insights.
