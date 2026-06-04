@@ -5,7 +5,7 @@ import {
 } from "recharts";
 import "./App.css";
 
-const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8001";
 const CHART_COLORS = ["#00f5d4", "#f72585", "#fee440", "#7209b7", "#4cc9f0", "#f3722c"];
 const PAGE_SIZE = 20;
 const BOOKMARKS_KEY = "querymind_bookmarks";
