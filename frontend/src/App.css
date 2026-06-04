@@ -582,6 +582,50 @@ button:disabled {
   color: #b9f8ce;
 }
 
+/* upload banner internals */
+.upload-success-body {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.upload-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border: 1px solid rgba(0, 230, 207, 0.32);
+  border-radius: 999px;
+  background: rgba(0, 230, 207, 0.1);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.upload-total,
+.upload-cols {
+  color: rgba(185, 248, 206, 0.65);
+  font-size: 12px;
+}
+
+.upload-db-tag {
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
 .upload-error,
 .error-box {
   border: 1px solid rgba(255, 92, 138, 0.28);

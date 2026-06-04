@@ -14,9 +14,11 @@ from fastapi.responses import StreamingResponse
 import pandas as pd
 import json
 import io
+import os
 import uuid
 from datetime import datetime
 import re
+import hashlib
 from fastapi import HTTPException
 
 DANGEROUS_KEYWORDS = [
@@ -282,6 +284,9 @@ async def upload_database_legacy(file: UploadFile = File(...)):
 @app.get("/schema")
 def get_schema():
     try:
+        if not get_active_conn_id():
+            return {"schema": [], "active_db": ""}
+
         engine = get_engine()
 
         db_type = ""
@@ -330,7 +335,8 @@ def get_schema():
 
                 table_name = table_row[0]
 
-                if table_name.startswith("sqlite_"):
+                # Hide SQLite/system metadata tables from the user-facing schema.
+                if table_name.startswith("sqlite_") or table_name.startswith("_"):
                     continue
 
                 # =========================================================
@@ -605,29 +611,242 @@ def clear_history():
     return {"message": "History cleared"}
 
 
-# ── CSV Upload ────────────────────────────────────────────────────────────────
+# ── CSV / Excel Upload  (isolated DB + incremental layer) ────────────────────
+
+# How the layer system works
+# ─────────────────────────────────────────────────────────────────────────────
+# Every uploaded file gets its OWN SQLite database under datasets/
+# so it never pollutes the active connection (employees.db etc.)
+#
+# Inside that SQLite file two things are created:
+#   1.  <table_name>          – the actual data table
+#   2.  _ingest_log           – tracks every upload: batch_id, timestamp,
+#                               rows_added, source_file, mode
+#
+# Upload modes
+#   replace   – drop & recreate table (default first upload)
+#   append    – add new rows, skip exact duplicates (incremental)
+#   overwrite – always replace even if DB already exists
+#
+# The frontend can pass ?mode=append to do incremental loads.
+# ─────────────────────────────────────────────────────────────────────────────
+
+from sqlalchemy import create_engine as _ce
+
+DATASET_DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets")
+os.makedirs(DATASET_DB_DIR, exist_ok=True)
+
+# registry: filename_stem -> { db_path, table_name, conn_id }
+_csv_registry: dict = {}
+
+
+def _sanitize_name(filename: str) -> str:
+    stem = filename.rsplit(".", 1)[0]
+    return re.sub(r"[^\w]", "_", stem).strip("_").lower() or "uploaded_data"
+
+
+def _get_or_create_csv_engine(table_name: str):
+    """Return (engine, db_path) for an isolated per-file SQLite DB."""
+    db_path = os.path.join(DATASET_DB_DIR, f"{table_name}.db")
+    engine = _ce(f"sqlite:///{db_path}", echo=False)
+    return engine, db_path
+
+
+def _ensure_ingest_log(engine):
+    """Create _ingest_log table if it doesn't exist."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS _ingest_log (
+                batch_id    TEXT PRIMARY KEY,
+                source_file TEXT,
+                mode        TEXT,
+                rows_added  INTEGER,
+                total_rows  INTEGER,
+                ingested_at TEXT
+            )
+        """))
+
+
+def _incremental_append(df: pd.DataFrame, table_name: str, engine) -> int:
+    """
+    Append only rows that don't already exist.
+    Dedup is based on a SHA-256 hash of the entire row (all columns).
+    Returns number of NEW rows inserted.
+    """
+    from sqlalchemy import inspect as _inspect
+
+    # add row hash column for dedup
+    df = df.copy()
+    df["_row_hash"] = df.apply(
+        lambda r: hashlib.sha256(str(tuple(r)).encode()).hexdigest(), axis=1
+    )
+
+    inspector = _inspect(engine)
+    if table_name not in inspector.get_table_names():
+        # first time — just write everything
+        df.to_sql(table_name, engine, if_exists="replace", index=False)
+        return len(df)
+
+    # load existing hashes only (cheap)
+    with engine.connect() as conn:
+        try:
+            existing = set(
+                row[0] for row in
+                conn.execute(text(f'SELECT _row_hash FROM "{table_name}"')).fetchall()
+            )
+        except Exception:
+            existing = set()
+
+    new_rows = df[~df["_row_hash"].isin(existing)]
+
+    if len(new_rows) > 0:
+        new_rows.to_sql(table_name, engine, if_exists="append", index=False)
+
+    return len(new_rows)
+
 
 @app.post("/upload-csv")
-async def upload_csv(file: UploadFile = File(...)):
+async def upload_csv(
+    file: UploadFile = File(...),
+    mode: str = "replace"   # replace | append | overwrite
+):
+    """
+    Upload a CSV or Excel file.
+
+    Each file gets its own isolated SQLite database — it does NOT
+    touch the active connection (employees.db etc.).
+
+    Query parameters
+    ────────────────
+    mode=replace    Drop & recreate table (default for first upload)
+    mode=append     Incremental — only insert rows not already present
+    mode=overwrite  Always drop & recreate, even if DB exists
+    """
+    engine = None
     try:
-        df = pd.read_csv(file.file)
-        table_name = file.filename.replace(".csv", "").replace(" ", "_").replace("(", "").replace(")", "")
-        df.to_sql(table_name, con=get_engine(), if_exists="replace", index=False)
+        # ── 1. Read file into memory (fixes timeout on large files) ──────────
+        raw_bytes = await file.read()          # fully buffer async → sync safe
+        buf = io.BytesIO(raw_bytes)
+
+        filename = file.filename or "upload.csv"
+        ext = filename.rsplit(".", 1)[-1].lower()
+
+        if ext == "csv":
+            df = pd.read_csv(buf)
+        elif ext in ("xlsx", "xls"):
+            df = pd.read_excel(buf)
+        else:
+            return {"error": f"Unsupported file type: .{ext}. Use .csv or .xlsx"}
+
+        if df.empty:
+            return {"error": "Uploaded file is empty."}
+
+        # ── 2. Isolated DB per file ──────────────────────────────────────────
+        table_name = _sanitize_name(filename)
+        engine, db_path = _get_or_create_csv_engine(table_name)
+        _ensure_ingest_log(engine)
+
+        # ── 3. Incremental / replace layer ──────────────────────────────────
+        batch_id = str(uuid.uuid4())[:12]
+        now_iso  = datetime.now().isoformat(timespec="seconds")
+
+        if mode == "append":
+            rows_added = _incremental_append(df, table_name, engine)
+            write_mode = "append (incremental)"
+        else:
+            # replace or overwrite — drop & recreate
+            df_write = df.copy()
+            df_write["_row_hash"] = df_write.apply(
+                lambda r: hashlib.sha256(str(tuple(r)).encode()).hexdigest(), axis=1
+            )
+            df_write.to_sql(table_name, engine, if_exists="replace", index=False)
+            rows_added = len(df_write)
+            write_mode = mode
+
+        # total rows now in table
+        with engine.connect() as conn:
+            total_rows = conn.execute(
+                text(f'SELECT COUNT(*) FROM "{table_name}"')
+            ).fetchone()[0]
+
+        # write ingest log entry
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT OR REPLACE INTO _ingest_log
+                    (batch_id, source_file, mode, rows_added, total_rows, ingested_at)
+                VALUES
+                    (:bid, :src, :mode, :added, :total, :ts)
+            """), {
+                "bid":   batch_id,
+                "src":   filename,
+                "mode":  write_mode,
+                "added": rows_added,
+                "total": total_rows,
+                "ts":    now_iso
+            })
+
+        # ── 4. Register as a queryable connection ────────────────────────────
+        conn_id = f"csv_{table_name}"
+        if conn_id not in [c["id"] for c in list_connections()]:
+            add_connection(
+                conn_id=conn_id,
+                name=filename,
+                db_type="sqlite",
+                url=f"sqlite:///{db_path}",
+                display=f"{filename} (uploaded)",
+                is_sqlite_file=True,
+                filename=f"{table_name}.db"
+            )
+
+        # auto-switch to the new DB so queries hit it immediately
+        set_active_connection(conn_id)
+
+        # ── 5. Response ──────────────────────────────────────────────────────
         suggestions = [
             f"Show top 10 rows from {table_name}",
             f"Find summary statistics of {table_name}",
             f"Group data by important columns in {table_name}",
             f"Detect missing or null values in {table_name}",
-            f"What are trends in {table_name}?"
-]
+            f"What are the trends in {table_name}?"
+        ]
+
         return {
-            "message": "CSV uploaded successfully!",
-            "table_name": table_name,
-            "row_count": len(df),
-            "columns": list(df.columns),
-            "suggestions": suggestions,
-            "active_db": get_active_db()
+            "message": f"File '{filename}' uploaded successfully!",
+            "table_name":   table_name,
+            "db_file":      f"{table_name}.db",
+            "conn_id":      conn_id,
+            "mode":         write_mode,
+            "rows_added":   rows_added,
+            "total_rows":   total_rows,
+            "batch_id":     batch_id,
+            "columns":      [c for c in df.columns],
+            "suggestions":  suggestions,
+            "active_db":    get_active_db()
         }
+
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "detail": traceback.format_exc()}
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+
+@app.get("/upload-csv/log/{table_name}")
+def get_ingest_log(table_name: str):
+    """Return the full ingest history for an uploaded dataset."""
+    try:
+        _, db_path = _get_or_create_csv_engine(table_name)
+        engine = _ce(f"sqlite:///{db_path}", echo=False)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT * FROM _ingest_log ORDER BY ingested_at DESC")
+            ).fetchall()
+            cols = ["batch_id", "source_file", "mode", "rows_added", "total_rows", "ingested_at"]
+            return {
+                "table_name": table_name,
+                "log": [dict(zip(cols, r)) for r in rows]
+            }
     except Exception as e:
         return {"error": str(e)}
 

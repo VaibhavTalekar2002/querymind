@@ -10,6 +10,7 @@ const CHART_COLORS = ["#00f5d4", "#f72585", "#fee440", "#7209b7", "#4cc9f0", "#f
 const PAGE_SIZE = 20;
 const BOOKMARKS_KEY = "querymind_bookmarks";
 const REQUEST_TIMEOUT_MS = 30000;
+const UPLOAD_TIMEOUT_MS = 120000; // 2 min for file uploads
 const DANGEROUS_SQL_KEYWORDS = ["delete", "drop", "truncate", "update", "insert", "alter", "replace"];
 
 function hasDangerousKeyword(text = "") {
@@ -784,7 +785,7 @@ const DB_TYPES = [
   { value: "mssql",      label: "SQL Server", icon: "🪟", port: 1433 },
 ];
 
-function DBSwitcherPanel({ connections, activeConnId, onSwitch, onUploadDb, onConnected, onClose }) {
+function DBSwitcherPanel({ connections, activeConnId, onSwitch, onUploadDb, onConnected, onRefresh, onClose }) {
   const dbFileRef = useRef();
   const [uploading, setUploading] = useState(false);
   const [tab, setTab] = useState("list"); // list | add
@@ -793,6 +794,12 @@ function DBSwitcherPanel({ connections, activeConnId, onSwitch, onUploadDb, onCo
   const [testResult, setTestResult] = useState(null);
   const [saving, setSaving] = useState(false);
   const [uploadError, setUploadError] = useState("");
+
+  useEffect(() => {
+    // The connection registry can change after CSV uploads, so refresh when
+    // the switcher opens instead of trusting whatever state the header had.
+    onRefresh?.();
+  }, [onRefresh]);
 
   const handleDbUpload = async (e) => {
     const file = e.target.files[0]; if (!file) return;
@@ -803,7 +810,7 @@ function DBSwitcherPanel({ connections, activeConnId, onSwitch, onUploadDb, onCo
       const data = await safeJson(res);
       if (!res.ok) throw new Error(getApiError(data, "Database upload failed."));
       if (data.detail || data.error) throw new Error(getApiError(data, "Database upload failed."));
-      if (data.success) onUploadDb(data);
+      if (data.success) await onUploadDb(data);
       else setUploadError(getApiError(data, "Database upload failed."));
     } catch (err) {
       setUploadError(err.name === "AbortError" ? "Database upload timed out. Please try again." : err.message);
@@ -1110,6 +1117,7 @@ export default function App() {
       setConnections(Array.isArray(data.connections) ? data.connections : []);
       setActiveConnId(data.active || "");
       setActiveDb(data.active_display || "");
+      if (!data.active) setSchema([]);
     } catch (e) { console.error(e); }
   }, []);
   const fetchSchema = useCallback(async () => {
@@ -1117,9 +1125,10 @@ export default function App() {
       const res = await fetchWithTimeout(`${API}/schema`);
       const data = await safeJson(res);
       if (!res.ok) throw new Error(getApiError(data, "Could not load schema."));
-      setSchema(Array.isArray(data.schema) ? data.schema : []);
-      if (data.active_db) setActiveDb(data.active_db);
-      fetchConnections();
+      const nextSchema = Array.isArray(data.schema) ? data.schema : [];
+      setActiveDb(data.active_db || "");
+      await fetchConnections();
+      setSchema(nextSchema);
     } catch (e) { console.error(e); }
   }, [fetchConnections]);
   const fetchHistory = useCallback(async () => {
@@ -1151,7 +1160,7 @@ export default function App() {
         setActiveConnId(data.active);
         setActiveDb(data.display);
         showSwitchMessage(`Switched to ${data.display}`);
-        fetchSchema(); fetchConnections(); setShowDBSwitcher(false);
+        await fetchSchema(); setShowDBSwitcher(false);
       } else {
         showSwitchMessage(getApiError(data, "Database switch failed."));
       }
@@ -1159,12 +1168,12 @@ export default function App() {
       showSwitchMessage(e.name === "AbortError" ? "Database switch timed out. Please try again." : e.message);
     }
   };
-  const handleDbUploaded = (data) => {
+  const handleDbUploaded = async (data) => {
     if (data.connections) setConnections(data.connections);
     if (data.display) setActiveDb(data.display);
     if (data.active || data.conn_id) setActiveConnId(data.active || data.conn_id);
     showSwitchMessage(`Connected to ${data.display || data.message}`);
-    fetchSchema(); fetchConnections(); setShowDBSwitcher(false);
+    await fetchSchema(); setShowDBSwitcher(false);
   };
   const handleConnected = (data) => {
     if (data.connections) setConnections(data.connections);
@@ -1205,15 +1214,28 @@ export default function App() {
     const file = e.target.files[0]; if (!file) return;
     setUploading(true); setUploadStatus(null); setSuggestions([]);
     const formData = new FormData(); formData.append("file", file);
+    // use append mode if same filename was already uploaded this session
+    const mode = uploadStatus?.table_name === file.name.replace(/\.[^.]+$/, "").replace(/[^\w]/g, "_").toLowerCase()
+      ? "append" : "replace";
     try {
-      const res = await fetchWithTimeout(`${API}/upload-csv`, { method: "POST", body: formData });
+      const res = await fetchWithTimeout(
+        `${API}/upload-csv?mode=${mode}`,
+        { method: "POST", body: formData },
+        UPLOAD_TIMEOUT_MS   // longer timeout for large files
+      );
       const data = await safeJson(res);
-      if (!res.ok) throw new Error(getApiError(data, "CSV upload failed."));
-      if (data.detail || data.error) throw new Error(getApiError(data, "CSV upload failed."));
+      if (!res.ok) throw new Error(getApiError(data, "Upload failed."));
+      if (data.detail || data.error) throw new Error(getApiError(data, "Upload failed."));
       setUploadStatus(data);
       if (Array.isArray(data.suggestions)) setSuggestions(data.suggestions);
-      fetchSchema();
-    } catch (e) { setUploadStatus({ error: e.name === "AbortError" ? "CSV upload timed out. Please try again." : e.message }); }
+      // The upload response is authoritative for the newly active isolated DB;
+      // update the header before schema refresh completes.
+      if (data.conn_id) setActiveConnId(data.conn_id);
+      if (data.active_db) setActiveDb(data.active_db);
+      await fetchSchema();
+    } catch (e) {
+      setUploadStatus({ error: e.name === "AbortError" ? "Upload timed out. Try a smaller file or check your connection." : e.message });
+    }
     finally { setUploading(false); e.target.value = ""; }
   };
   const clearHistory = async () => {
@@ -1253,7 +1275,7 @@ export default function App() {
           <span className="logo-text">QueryMind<span className="logo-ai">.ai</span></span>
         </div>
         <div className="header-actions">
-          <button className="db-indicator" onClick={() => { setShowDBSwitcher(true); fetchConnections(); }}>
+          <button className="db-indicator" onClick={() => setShowDBSwitcher(true)}>
             <span className="dot green" />
             <span className="db-indicator-name">{activeDb || "No DB"}</span>
             <span className="db-indicator-arrow">⌄</span>
@@ -1269,9 +1291,9 @@ export default function App() {
           </button>
           <button className="hdr-btn upload-btn" onClick={() => fileRef.current.click()} disabled={uploading}>
             {uploading ? <span className="spinner" /> : <span>⬆</span>}
-            {uploading ? "Uploading..." : "Upload CSV"}
+            {uploading ? "Uploading..." : "Upload CSV / Excel"}
           </button>
-          <input ref={fileRef} type="file" accept=".csv" style={{ display: "none" }} onChange={handleUpload} />
+          <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" style={{ display: "none" }} onChange={handleUpload} />
         </div>
       </header>
 
@@ -1284,7 +1306,24 @@ export default function App() {
         {uploadStatus && !uploadStatus.error && (
           <div className="upload-success">
             <span className="dot green" />
-            <strong>{uploadStatus.table_name}</strong> uploaded — {uploadStatus.row_count?.toLocaleString()} rows, {uploadStatus.columns?.length} columns
+            <div className="upload-success-body">
+              <span>
+                <strong>{uploadStatus.table_name}</strong>
+                {" — "}
+                <span className="upload-mode-badge">{uploadStatus.mode || "replace"}</span>
+                {" "}
+                {(uploadStatus.rows_added ?? uploadStatus.row_count ?? 0).toLocaleString()} rows added
+                {uploadStatus.total_rows != null && uploadStatus.total_rows !== uploadStatus.rows_added &&
+                  <span className="upload-total"> ({uploadStatus.total_rows.toLocaleString()} total)</span>
+                }
+                {uploadStatus.columns?.length > 0 &&
+                  <span className="upload-cols">, {uploadStatus.columns.length} columns</span>
+                }
+              </span>
+              {uploadStatus.db_file && (
+                <span className="upload-db-tag">📦 {uploadStatus.db_file}</span>
+              )}
+            </div>
           </div>
         )}
         {uploadStatus?.error && <div className="upload-error">⚠ {uploadStatus.error}</div>}
@@ -1350,7 +1389,7 @@ export default function App() {
       {showSchema && <SchemaPanel schema={schema} activeDb={activeDb} onClose={() => setShowSchema(false)} />}
       {showHistory && <HistoryPanel history={history} onSelect={q => setQuestion(q)} onClear={clearHistory} onClose={() => setShowHistory(false)} />}
       {showBookmarks && <BookmarksPanel bookmarks={bookmarks} onSelect={q => { setQuestion(q); generateSQL(q); }} onDelete={deleteBookmark} onClose={() => setShowBookmarks(false)} />}
-      {showDBSwitcher && <DBSwitcherPanel connections={connections} activeConnId={activeConnId} onSwitch={switchDatabase} onUploadDb={handleDbUploaded} onConnected={handleConnected} onClose={() => setShowDBSwitcher(false)} />}
+      {showDBSwitcher && <DBSwitcherPanel connections={connections} activeConnId={activeConnId} onSwitch={switchDatabase} onUploadDb={handleDbUploaded} onConnected={handleConnected} onRefresh={fetchConnections} onClose={() => setShowDBSwitcher(false)} />}
     </div>
   );
 }
